@@ -7,34 +7,28 @@ import os
 import queue
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import tkinter as tk
-import wave
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
+from PIL import Image, ImageTk
 
 from . import engine
-from .engine import HOP, ANALYSIS_SR, fmt_time
-
-try:
-    import winsound
-except ImportError:  # preview playback is Windows-only for now
-    winsound = None
+from .engine import HOP, fmt_time
 
 SETTINGS = Path.home() / ".freecut.json"
 MEDIA_TYPES = [("Video / audio", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mts *.mxf *.mp3 *.wav *.m4a "
                                  "*.aac *.flac *.ogg *.opus"), ("All files", "*.*")]
 C = dict(bg="#15161a", panel="#1f2026", raised="#2b2d35", hover="#363944", grid="#2e3038",
-         text="#dfe1e8", dim="#8b909d", wave="#6cb8ff", wave_cut="#4d5566", cut="#3d2027",
-         cut_off="#6b6f7c", manual="#3f2240", thr="#f2c14e", head="#ffffff", accent="#2f6fd6",
-         drag="#5a3a1f")
+         text="#dfe1e8", dim="#8b909d", wave="#6cb8ff", wave_cut="#4d5566", wave_off="#3a3e48",
+         cut="#3d2027", cut_off="#6b6f7c", manual="#3f2240", thr="#f2c14e", head="#ffffff",
+         accent="#2f6fd6", lane="#1b1c21")
 VIEW_FLOOR_DB = -70.0
 RULER = 24
-PREVIEW_MAX = 300.0  # seconds of preview audio built per play
+MAX_PREVIEW_W = 960
 
 SLIDERS = [  # key, label, min, max, step, unit
     ("threshold_db", "Silence threshold", -70.0, -10.0, 0.5, "dB"),
@@ -45,20 +39,31 @@ SLIDERS = [  # key, label, min, max, step, unit
 ]
 
 
+def resource(rel: str) -> Path:
+    base = getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)
+    return Path(base) / rel
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.info: engine.MediaInfo | None = None
         self.an: engine.Analysis | None = None
+        self.track_on: list[bool] = []
+        self.db: np.ndarray | None = None       # combined loudness of the enabled tracks
         self.silences: list[tuple[float, float]] = []
         self.silence_on: list[bool] = []
-        self.kept_times: list[float] = []      # clicks that turned a silence off
+        self.kept_times: list[float] = []       # clicks that turned a silence off
         self.manual: list[tuple[float, float]] = []
         self.cuts: list[tuple[float, float]] = []
         self.keeps: list[tuple[float, float]] = []
         self.view = [0.0, 1.0]
         self.playhead = 0.0
-        self.play_state = None                 # (t0, mapping, total, wav_path) while previewing
+        self.player = None
+        self.photo = None
+        self.photo_size = None
+        self._still_token = 0
+        self._still_job = None
         self.busy = False
         self.cancel_flag = False
         self.msgs: queue.Queue = queue.Queue()
@@ -67,9 +72,13 @@ class App:
         self.settings = self._load_settings()
 
         root.title("Freecut")
-        root.geometry("1360x800")
-        root.minsize(1000, 640)
+        root.geometry("1400x900")
+        root.minsize(1000, 680)
         root.configure(bg=C["bg"])
+        try:
+            root.iconbitmap(str(resource("assets/freecut.ico")))
+        except Exception:
+            pass
         self._style()
         self._build()
         self._bind()
@@ -80,10 +89,10 @@ class App:
     def _style(self):
         s = ttk.Style(self.root)
         s.theme_use("clam")
-        font = ("Segoe UI", 10)
         s.configure(".", background=C["panel"], foreground=C["text"], fieldbackground=C["bg"],
                     bordercolor=C["grid"], darkcolor=C["panel"], lightcolor=C["panel"],
-                    troughcolor=C["bg"], arrowcolor=C["text"], font=font, focuscolor=C["panel"])
+                    troughcolor=C["bg"], arrowcolor=C["text"], font=("Segoe UI", 10),
+                    focuscolor=C["panel"])
         s.configure("TFrame", background=C["panel"])
         s.configure("Bg.TFrame", background=C["bg"])
         s.configure("TLabel", background=C["panel"], foreground=C["text"])
@@ -110,6 +119,9 @@ class App:
                     borderwidth=0, thickness=6)
         s.configure("Horizontal.TScrollbar", background=C["raised"], troughcolor=C["bg"],
                     borderwidth=0, arrowsize=12)
+        s.configure("TPanedwindow", background=C["bg"])
+        s.configure("Sash", sashthickness=6, background=C["bg"], lightcolor=C["bg"],
+                    bordercolor=C["bg"], gripcount=0)
         self.root.option_add("*TCombobox*Listbox.background", C["bg"])
         self.root.option_add("*TCombobox*Listbox.foreground", C["text"])
         self.root.option_add("*TCombobox*Listbox.selectBackground", C["accent"])
@@ -129,6 +141,15 @@ class App:
         self.time_lbl = ttk.Label(top, text="", style="Bar.TLabel")
         self.time_lbl.pack(side="right")
 
+        # status bar first so it keeps its space at the bottom
+        bar = ttk.Frame(root, style="Bg.TFrame", padding=(12, 4, 12, 8))
+        bar.pack(fill="x", side="bottom")
+        self.status = ttk.Label(bar, text="Open a file to get started (Ctrl+O).", style="Bar.TLabel")
+        self.status.pack(side="left")
+        self.btn_cancel = ttk.Button(bar, text="Cancel", style="Small.TButton", takefocus=False,
+                                     command=self._cancel)
+        self.progress = ttk.Progressbar(bar, length=260, maximum=1.0)
+
         body = ttk.Frame(root, style="Bg.TFrame")
         body.pack(fill="both", expand=True)
 
@@ -138,13 +159,25 @@ class App:
 
         left = ttk.Frame(body, style="Bg.TFrame", padding=(12, 0, 8, 0))
         left.pack(side="left", fill="both", expand=True)
-        self.canvas = tk.Canvas(left, bg=C["bg"], highlightthickness=0, cursor="crosshair")
+        self.paned = ttk.PanedWindow(left, orient="vertical")
+        self.paned.pack(fill="both", expand=True)
+
+        self.video_frame = tk.Frame(self.paned, bg="black")
+        self.video_lbl = tk.Label(self.video_frame, bg="black", fg=C["dim"], font=("Segoe UI", 11))
+        self.video_lbl.pack(fill="both", expand=True)
+        self.video_lbl.bind("<Configure>", lambda e: self._request_still(200))
+        self.video_shown = False
+
+        tl = ttk.Frame(self.paned, style="Bg.TFrame")
+        self.canvas = tk.Canvas(tl, bg=C["bg"], highlightthickness=0, cursor="crosshair", height=260)
         self.canvas.pack(fill="both", expand=True)
-        self.hbar = ttk.Scrollbar(left, orient="horizontal", command=self._on_scrollbar)
+        self.hbar = ttk.Scrollbar(tl, orient="horizontal", command=self._on_scrollbar)
         self.hbar.pack(fill="x", pady=(4, 0))
-        ttk.Label(left, style="Bar.TLabel", text=(
+        ttk.Label(tl, style="Bar.TLabel", text=(
             "Click red area: keep it  ·  Drag: cut by hand  ·  Right-click: undo hand cut  ·  "
-            "Click: move playhead  ·  Wheel: zoom  ·  Shift+wheel: scroll  ·  Space: preview")).pack(anchor="w", pady=(4, 8))
+            "Click: move playhead  ·  Wheel: zoom  ·  Shift+wheel: scroll  ·  Space: preview")
+                  ).pack(anchor="w", pady=(4, 4))
+        self.paned.add(tl, weight=2)
 
         # --- detection controls
         ttk.Label(side, text="DETECTION", style="Head.TLabel").pack(anchor="w")
@@ -163,10 +196,11 @@ class App:
             if key == "threshold_db":
                 ttk.Button(row, text="Auto", style="Small.TButton", takefocus=False,
                            command=self.auto_threshold).pack(side="right", padx=8)
-            sc = ttk.Scale(side, from_=lo, to=hi, variable=v, takefocus=False,
-                           command=lambda _v, k=key, st=step: self._on_slider(k, st))
-            sc.pack(fill="x", pady=(4, 0))
+            ttk.Scale(side, from_=lo, to=hi, variable=v, takefocus=False,
+                      command=lambda _v, k=key, st=step: self._on_slider(k, st)).pack(fill="x", pady=(4, 0))
             self._update_val_label(key)
+        self.tracks_lbl = ttk.Label(side, text="", style="Dim.TLabel", wraplength=295)
+        self.tracks_lbl.pack(anchor="w", pady=(10, 0))
 
         # --- result
         ttk.Separator(side).pack(fill="x", pady=12)
@@ -208,15 +242,6 @@ class App:
             b.pack(fill="x", pady=(10 if i == 0 else 6, 0))
             b.state(["disabled"])
 
-        # --- status bar
-        bar = ttk.Frame(root, style="Bg.TFrame", padding=(12, 4, 12, 8))
-        bar.pack(fill="x", side="bottom", before=body)
-        self.status = ttk.Label(bar, text="Open a file to get started (Ctrl+O).", style="Bar.TLabel")
-        self.status.pack(side="left")
-        self.btn_cancel = ttk.Button(bar, text="Cancel", style="Small.TButton", takefocus=False,
-                                     command=self._cancel)
-        self.progress = ttk.Progressbar(bar, length=260, maximum=1.0)
-
     def _bind(self):
         c = self.canvas
         c.bind("<Configure>", lambda e: self.redraw())
@@ -230,7 +255,7 @@ class App:
         c.bind("<Button-5>", lambda e: self._on_wheel(e, delta=-120))
         self.root.bind("<Control-o>", lambda e: self.open_dialog())
         self.root.bind("<space>", self._on_space)
-        self.root.bind("<Home>", lambda e: self._set_playhead(0.0))
+        self.root.bind("<Home>", lambda e: self._seek(0.0))
 
     # ------------------------------------------------------------------ settings
     def _load_settings(self) -> dict:
@@ -288,6 +313,9 @@ class App:
                     self._on_loaded(m[1], m[2])
                 elif kind == "exported":
                     self.root.after(100, self._on_exported, m[1])  # after the "idle" message
+                elif kind == "still":
+                    if m[1] == self._still_token and self.player is None and m[2]:
+                        self._show_frame(m[2], m[3])
                 elif kind == "idle":
                     self.busy = False
                     self.progress.pack_forget()
@@ -308,7 +336,7 @@ class App:
         for b in self.export_btns:
             b.state(["!disabled"] if loaded else ["disabled"])
         self.btn_open.state(["disabled"] if self.busy else ["!disabled"])
-        self.btn_play.state(["!disabled"] if loaded and winsound else ["disabled"])
+        self.btn_play.state(["!disabled"] if loaded else ["disabled"])
         edits = bool(self.kept_times or self.manual)
         self.btn_reset.state(["!disabled"] if edits and loaded else ["disabled"])
 
@@ -335,17 +363,31 @@ class App:
 
     def _on_loaded(self, info: engine.MediaInfo, an: engine.Analysis):
         self.info, self.an = info, an
+        self.track_on = [True] * len(info.audio)
         self.kept_times, self.manual = [], []
         self.playhead = 0.0
         self.view = [0.0, max(info.duration, 1.0)]
         self.root.title(f"Freecut — {Path(info.path).name}")
         kind = (f"{info.width}×{info.height} · {float(info.timeline_fps):.3g} fps"
                 if info.has_video else "audio only")
-        self.file_lbl.configure(text=f"{Path(info.path).name}   ·   {fmt_time(info.duration)}   ·   {kind}")
-        self.vars["threshold_db"].set(engine.auto_threshold(an.db))
+        tracks = f"{len(info.audio)} audio tracks" if len(info.audio) > 1 else "1 audio track"
+        self.file_lbl.configure(
+            text=f"{Path(info.path).name}   ·   {fmt_time(info.duration)}   ·   {kind}   ·   {tracks}")
+        # video pane only for files with video
+        if info.has_video and not self.video_shown:
+            self.paned.insert(0, self.video_frame, weight=3)
+            self.video_shown = True
+        elif not info.has_video and self.video_shown:
+            self.paned.forget(self.video_frame)
+            self.video_shown = False
+        self.photo = self.photo_size = None
+        self.video_lbl.configure(image="", text="")
+        self.db = an.combined(self.track_on)
+        self.vars["threshold_db"].set(engine.auto_threshold(self.db))
         self._update_val_label("threshold_db")
         self._set_status("Ready. Red areas will be removed.")
         self.recompute()
+        self._request_still()
 
     # ------------------------------------------------------------------ detection
     def params(self) -> engine.Params:
@@ -369,7 +411,7 @@ class App:
 
     def auto_threshold(self):
         if self.an is not None:
-            self.vars["threshold_db"].set(engine.auto_threshold(self.an.db))
+            self.vars["threshold_db"].set(engine.auto_threshold(self.db))
             self._update_val_label("threshold_db")
             self.recompute()
 
@@ -377,12 +419,18 @@ class App:
         self.kept_times, self.manual = [], []
         self.recompute()
 
+    def toggle_track(self, i: int):
+        self.stop_play()
+        self.track_on[i] = not self.track_on[i]
+        self.db = self.an.combined(self.track_on)
+        self.recompute()
+
     def recompute(self):
         self._redraw_job = None
         if self.an is None:
             return
         dur = self.info.duration
-        self.silences = engine.detect_silences(self.an.db, dur, self.params())
+        self.silences = engine.detect_silences(self.db, dur, self.params())
         kt = sorted(self.kept_times)
         self.silence_on = []
         for a, b in self.silences:
@@ -399,6 +447,14 @@ class App:
         extra = f"   ·   {n_off} kept by hand" if n_off else ""
         extra += f"   ·   {len(self.manual)} cut by hand" if self.manual else ""
         self.cut_lbl.configure(text=f"{len(self.cuts)} cuts{extra}")
+        if len(self.track_on) > 1:
+            on = [str(i + 1) for i, v in enumerate(self.track_on) if v]
+            self.tracks_lbl.configure(text=(
+                f"Listening to track{'s' if len(on) > 1 else ''} {', '.join(on)} for silence. "
+                "Click a track name in the timeline to include or ignore it." if on else
+                "All tracks are ignored, so nothing is detected. Click a track name to include it."))
+        else:
+            self.tracks_lbl.configure(text="")
         self._update_buttons()
         self.redraw()
 
@@ -443,6 +499,12 @@ class App:
         new_len = length * f
         self._set_view(anchor - (anchor - t0) * (new_len / length), new_len)
 
+    def _lanes(self, H):
+        n = len(self.an.dbs)
+        top, bot, gap = RULER + 4, H - 4, 8
+        h = (bot - top - gap * (n - 1)) / n
+        return [(top + i * (h + gap), top + i * (h + gap) + h) for i in range(n)]
+
     def redraw(self):
         c = self.canvas
         c.delete("all")
@@ -456,12 +518,14 @@ class App:
             return
         dur = self.info.duration
         t0, t1 = self.view
+        span = t1 - t0
         self.hbar.set(t0 / dur, t1 / dur)
-        top, bot = RULER + 6, H - 6
-        mid, half = (top + bot) / 2, (bot - top) / 2
+        lanes = self._lanes(H)
+        top, bot = lanes[0][0], lanes[-1][1]
+        for lt, lb in lanes:
+            c.create_rectangle(0, lt, W, lb, fill=C["lane"], outline="")
 
         # ruler
-        span = t1 - t0
         step = next((s for s in (0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900,
                                  1800, 3600) if s / span * W >= 90), 7200)
         t = (t0 // step) * step
@@ -473,7 +537,7 @@ class App:
                           text=fmt_time(t, dec))
             t += step
 
-        # silence regions
+        # silence regions span all lanes
         i = max(bisect.bisect_left(self.silences, (t0, t0)) - 1, 0)
         for (a, b), on in zip(self.silences[i:], self.silence_on[i:]):
             if a > t1:
@@ -489,48 +553,58 @@ class App:
             if b >= t0 and a <= t1:
                 c.create_rectangle(self._t2x(a), top, self._t2x(b), bot, fill=C["manual"], outline="")
 
-        # waveform (loudness envelope), grey where it will be cut
-        db = self.an.db
-        i0, i1 = int(t0 / HOP), min(int(np.ceil(t1 / HOP)) + 1, len(db))
-        seg = db[i0:i1]
-        if len(seg):
-            cols = W
-            if len(seg) >= cols:
-                edges = np.linspace(0, len(seg), cols + 1).astype(int)[:-1]
-                vals = np.maximum.reduceat(seg, edges)
-            else:
-                idx = np.minimum((np.arange(cols) * len(seg) / cols).astype(int), len(seg) - 1)
-                vals = seg[idx]
-            amp = np.clip((vals - VIEW_FLOOR_DB) / -VIEW_FLOOR_DB, 0.0, 1.0) * half * 0.96 + 0.5
-            times = t0 + (np.arange(cols) + 0.5) / cols * span
-            if self.cuts:
-                ca = np.array([a for a, _ in self.cuts])
-                cb = np.array([b for _, b in self.cuts])
-                k = np.searchsorted(ca, times, side="right") - 1
-                cut = (k >= 0) & (times < cb[np.maximum(k, 0)])
-            else:
-                cut = np.zeros(cols, bool)
-            d = np.diff(np.concatenate(([-1], cut.astype(np.int8), [-1])))
-            starts = np.flatnonzero(d != 0)[:-1]
-            bounds = list(starts) + [cols]
-            for s, e in zip(bounds[:-1], bounds[1:]):
-                xs = np.arange(s, min(e + 1, cols))
-                ys = amp[s:min(e + 1, cols)]
-                if len(xs) == 1:
-                    xs, ys = np.array([xs[0], xs[0] + 1]), np.repeat(ys, 2)
-                pts = np.concatenate([np.column_stack([xs, mid - ys]).ravel(),
-                                      np.column_stack([xs[::-1], mid + ys[::-1]]).ravel()])
-                c.create_polygon(*pts.tolist(), fill=C["wave_cut"] if cut[s] else C["wave"], outline="")
+        # which screen columns are cut
+        times = t0 + (np.arange(W) + 0.5) / W * span
+        if self.cuts:
+            ca = np.array([a for a, _ in self.cuts])
+            cb = np.array([b for _, b in self.cuts])
+            k = np.searchsorted(ca, times, side="right") - 1
+            cut = (k >= 0) & (times < cb[np.maximum(k, 0)])
+        else:
+            cut = np.zeros(W, bool)
+        d = np.diff(np.concatenate(([-1], cut.astype(np.int8), [-1])))
+        bounds = list(np.flatnonzero(d != 0)[:-1]) + [W]
 
-        # threshold
         thr = self.vars["threshold_db"].get()
-        off = np.clip((thr - VIEW_FLOOR_DB) / -VIEW_FLOOR_DB, 0, 1) * half * 0.96
-        for y in (mid - off, mid + off):
-            c.create_line(0, y, W, y, fill=C["thr"], dash=(6, 4))
-        c.create_text(W - 6, mid - off - 3, anchor="se", fill=C["thr"], font=("Segoe UI", 8),
-                      text=f"{thr:.1f} dB")
+        multi = len(lanes) > 1
+        for li, ((lt, lb), db) in enumerate(zip(lanes, self.an.dbs)):
+            on = self.track_on[li]
+            mid, half = (lt + lb) / 2, (lb - lt) / 2
+            i0, i1 = int(t0 / HOP), min(int(np.ceil(t1 / HOP)) + 1, len(db))
+            seg = db[i0:i1]
+            if len(seg):
+                if len(seg) >= W:
+                    vals = np.maximum.reduceat(seg, np.linspace(0, len(seg), W + 1).astype(int)[:-1])
+                else:
+                    vals = seg[np.minimum((np.arange(W) * len(seg) / W).astype(int), len(seg) - 1)]
+                amp = np.clip((vals - VIEW_FLOOR_DB) / -VIEW_FLOOR_DB, 0.0, 1.0) * half * 0.92 + 0.5
+                for s, e in zip(bounds[:-1], bounds[1:]):
+                    xs = np.arange(s, min(e + 1, W))
+                    ys = amp[s:min(e + 1, W)]
+                    if len(xs) == 1:
+                        xs, ys = np.array([xs[0], xs[0] + 1]), np.repeat(ys, 2)
+                    pts = np.concatenate([np.column_stack([xs, mid - ys]).ravel(),
+                                          np.column_stack([xs[::-1], mid + ys[::-1]]).ravel()])
+                    color = C["wave_off"] if not on else C["wave_cut"] if cut[s] else C["wave"]
+                    c.create_polygon(*pts.tolist(), fill=color, outline="")
+            if on:
+                off = np.clip((thr - VIEW_FLOOR_DB) / -VIEW_FLOOR_DB, 0, 1) * half * 0.92
+                for y in (mid - off, mid + off):
+                    c.create_line(0, y, W, y, fill=C["thr"], dash=(6, 4))
+            if multi:  # clickable track header
+                tag = f"lane{li}"
+                label = ("☑  " if on else "☐  ") + self.info.audio[li].label
+                txt = c.create_text(10, lt + 6, anchor="nw", text=label, font=("Segoe UI", 9),
+                                    fill=C["text"] if on else C["dim"], tags=(tag,))
+                x0, y0, x1, y1 = c.bbox(txt)
+                bg = c.create_rectangle(x0 - 6, y0 - 3, x1 + 6, y1 + 3, fill=C["panel"],
+                                        outline=C["grid"], tags=(tag,))
+                c.tag_raise(txt, bg)
+                c.tag_bind(tag, "<Enter>", lambda e: self.canvas.configure(cursor="hand2"))
+                c.tag_bind(tag, "<Leave>", lambda e: self.canvas.configure(cursor="crosshair"))
+        c.create_text(W - 6, top + 4, anchor="ne", fill=C["thr"], font=("Segoe UI", 8),
+                      text=f"threshold {thr:.1f} dB")
 
-        # playhead
         x = self._t2x(self.playhead)
         c.create_line(x, RULER - 6, x, H, fill=C["head"], width=1, tags="head")
         self._update_time_label()
@@ -560,6 +634,52 @@ class App:
         self.canvas.coords("head", x, RULER - 6, x, self.canvas.winfo_height())
         self._update_time_label()
 
+    def _seek(self, t):
+        """Move the playhead; keeps playing from there if the preview is running."""
+        playing = self.player is not None
+        self.stop_play()
+        self._set_playhead(t)
+        if playing:
+            self.start_play()
+        else:
+            self._request_still()
+
+    # ------------------------------------------------------------------ video frames
+    def _video_fit(self) -> tuple[int, int] | None:
+        if not (self.info and self.info.has_video and self.video_shown):
+            return None
+        W, H = self.video_lbl.winfo_width(), self.video_lbl.winfo_height()
+        iw, ih = (self.info.width, self.info.height) if self.info.width else (16, 9)
+        s = min(W / iw, H / ih, MAX_PREVIEW_W / iw, 1.0)
+        w, h = int(iw * s) // 2 * 2, int(ih * s) // 2 * 2
+        return (w, h) if w >= 32 and h >= 32 else None
+
+    def _show_frame(self, data: bytes, size):
+        im = Image.frombuffer("RGB", size, data, "raw", "RGB", 0, 1)
+        if self.photo is None or self.photo_size != size:
+            self.photo = ImageTk.PhotoImage(im)
+            self.photo_size = size
+            self.video_lbl.configure(image=self.photo)
+        else:
+            self.photo.paste(im)
+
+    def _request_still(self, delay=60):
+        if self._still_job:
+            self.root.after_cancel(self._still_job)
+        self._still_job = self.root.after(delay, self._fetch_still)
+
+    def _fetch_still(self):
+        self._still_job = None
+        size = self._video_fit()
+        if self.player is not None or size is None:
+            return
+        self._still_token += 1
+        token, path, t = self._still_token, self.info.path, self.playhead
+
+        def job():
+            self.msgs.put(("still", token, engine.grab_frame(path, t, *size), size))
+        threading.Thread(target=job, daemon=True).start()
+
     # ------------------------------------------------------------------ mouse editing
     def _region_at(self, t, regions):
         for i, (a, b) in enumerate(regions):
@@ -570,6 +690,12 @@ class App:
     def _on_press(self, e):
         if self.an is None:
             return
+        cur = self.canvas.find_withtag("current")
+        for tag in self.canvas.gettags(cur[0]) if cur else ():
+            if tag.startswith("lane") and tag[4:].isdigit():
+                self._press = None
+                self.toggle_track(int(tag[4:]))
+                return
         self._press = e.x
 
     def _on_drag(self, e):
@@ -577,7 +703,7 @@ class App:
             return
         self.canvas.delete("drag")
         H = self.canvas.winfo_height()
-        self.canvas.create_rectangle(self._press, RULER + 6, e.x, H - 6, fill="", outline=C["thr"],
+        self.canvas.create_rectangle(self._press, RULER + 4, e.x, H - 4, fill="", outline=C["thr"],
                                      width=2, tags="drag")
 
     def _on_release(self, e):
@@ -604,7 +730,7 @@ class App:
                 self.kept_times = [k for k in self.kept_times if not a <= k <= b]
             self.recompute()
         else:
-            self._set_playhead(t)
+            self._seek(t)
 
     def _on_right_click(self, e):
         if self.an is None:
@@ -623,77 +749,53 @@ class App:
         return "break"
 
     def toggle_play(self):
-        if self.play_state:
+        if self.player:
             self.stop_play()
         else:
             self.start_play()
 
     def start_play(self):
-        if self.an is None or winsound is None or self.busy:
+        if self.an is None or self.busy or self.player:
             return
+        from .player import Player  # imported late: needs an audio device
         start = self.playhead
         if start >= self.info.duration - 0.05:
             start = 0.0
-        samples, sr, fade = self.an.samples, ANALYSIS_SR, 80
-        parts, mapping, out = [], [], 0.0
-        for a, b in self.keeps:
-            if b <= start:
-                continue
-            a = max(a, start)
-            seg = samples[int(a * sr):int(b * sr)].astype(np.float32)
-            if len(seg) > 2 * fade:
-                ramp = np.linspace(0, 1, fade, dtype=np.float32)
-                seg[:fade] *= ramp
-                seg[-fade:] *= ramp[::-1]
-            parts.append(seg.astype(np.int16))
-            mapping.append((out, a))
-            out += len(seg) / sr
-            if out >= PREVIEW_MAX:
-                break
-        if not parts:
+        try:
+            self.player = Player(self.info, self.keeps, start, self._video_fit())
+            self.player.start()
+        except Exception as e:
+            self.player = None
+            messagebox.showerror("Freecut", f"Could not start playback:\n{e}", parent=self.root)
             return
-        fd, path = tempfile.mkstemp(suffix=".wav", prefix="freecut_preview_")
-        os.close(fd)
-        with wave.open(path, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(sr)
-            w.writeframes(np.concatenate(parts).tobytes())
-        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
-        self.play_state = (time.perf_counter(), mapping, out, path)
         self.btn_play.configure(text="■  Stop")
         self._tick()
 
     def _tick(self):
-        if not self.play_state:
+        p = self.player
+        if p is None:
             return
-        t_start, mapping, total, _ = self.play_state
-        el = time.perf_counter() - t_start
-        if el >= total:
+        if p.finished:
             self.stop_play()
             return
-        i = bisect.bisect_right([m[0] for m in mapping], el) - 1
-        out0, src0 = mapping[max(i, 0)]
-        self._set_playhead(src0 + (el - out0), follow=True)
-        self.root.after(30, self._tick)
+        src = p.src_time()
+        if p.video_size:
+            fr = p.frame_for(src)
+            if fr:
+                self._show_frame(fr[1], p.video_size)
+        self._set_playhead(src, follow=True)
+        self.root.after(15, self._tick)
 
     def stop_play(self):
-        if not self.play_state:
+        if not self.player:
             return
-        path = self.play_state[3]
-        self.play_state = None
-        if winsound:
-            winsound.PlaySound(None, 0)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        self.player.stop()
+        self.player = None
         self.btn_play.configure(text="▶  Preview")
 
     # ------------------------------------------------------------------ export
     def _default_name(self, ext):
-        p = Path(self.info.path)
-        return f"{p.stem}_freecut{ext}"
+        return f"{Path(self.info.path).stem}_freecut{ext}"
 
     def export_media(self):
         if self.an is None or self.busy:
@@ -763,12 +865,14 @@ def main():
         try:
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Freecut")
         except Exception:
             pass
     root = tk.Tk()
     app = App(root)
-    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
-        root.after(200, lambda: app.open_file(sys.argv[1]))
+    args = [a for a in sys.argv[1:] if os.path.isfile(a)]
+    if args:
+        root.after(200, lambda: app.open_file(args[0]))
     root.mainloop()
 
 

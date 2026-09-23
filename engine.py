@@ -11,17 +11,17 @@ import shutil
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from fractions import Fraction
 from pathlib import Path
 from urllib.parse import quote
 
 import numpy as np
 
-ANALYSIS_SR = 16000          # mono sample rate used for analysis and preview
+ANALYSIS_SR = 16000          # mono sample rate used for loudness analysis
 HOP = 0.01                   # seconds per loudness window
 DB_FLOOR = -100.0
-_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
 class Cancelled(Exception):
@@ -39,7 +39,26 @@ def ffmpeg_exe() -> str:
         raise RuntimeError("ffmpeg not found. Install it with:  pip install imageio-ffmpeg")
 
 
+def popen(cmd, **kw) -> subprocess.Popen:
+    """Popen that never flashes a console window and never inherits stdin."""
+    return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW, **kw)
+
+
 # --------------------------------------------------------------------------- probing
+
+@dataclass
+class AudioStream:
+    index: int               # n-th audio stream (0-based), i.e. ffmpeg's 0:a:<index>
+    channels: int = 2
+    sample_rate: int = 48000
+    title: str = ""
+
+    @property
+    def label(self) -> str:
+        layout = {1: "mono", 2: "stereo", 6: "5.1", 8: "7.1"}.get(self.channels, f"{self.channels} ch")
+        name = f"Track {self.index + 1}"
+        return f"{name} · {self.title} · {layout}" if self.title else f"{name} · {layout}"
+
 
 @dataclass
 class MediaInfo:
@@ -49,14 +68,21 @@ class MediaInfo:
     width: int = 0
     height: int = 0
     fps: Fraction | None = None
-    has_audio: bool = False
-    sample_rate: int = 48000
-    channels: int = 2
+    audio: list[AudioStream] = field(default_factory=list)
     timecode: str | None = None    # embedded start timecode, e.g. "01:00:00:00"
+    start_time: float = 0.0        # container start; stream timestamps are relative to this
 
     @property
     def timeline_fps(self) -> Fraction:
         return self.fps or Fraction(30)
+
+    @property
+    def sample_rate(self) -> int:
+        return self.audio[0].sample_rate
+
+    @property
+    def channels(self) -> int:
+        return self.audio[0].channels
 
 
 def _to_rate(f: float) -> Fraction:
@@ -68,9 +94,18 @@ def _to_rate(f: float) -> Fraction:
     return Fraction(f).limit_denominator(1001)
 
 
+def _channels(line: str) -> int:
+    for key, n in (("mono", 1), ("stereo", 2), ("5.1", 6), ("7.1", 8), ("quad", 4)):
+        if key in line:
+            return n
+    r = re.search(r"(\d+) channels", line)
+    return int(r[1]) if r else 2
+
+
 def probe(path: str) -> MediaInfo:
     res = subprocess.run([ffmpeg_exe(), "-hide_banner", "-i", path], capture_output=True,
-                         text=True, encoding="utf-8", errors="replace", creationflags=_NO_WINDOW)
+                         stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                         creationflags=NO_WINDOW)
     out = res.stderr
     if "Invalid data found" in out or "No such file" in out:
         raise RuntimeError(f"ffmpeg can't read this file:\n{out.strip().splitlines()[-1]}")
@@ -81,36 +116,33 @@ def probe(path: str) -> MediaInfo:
         duration = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
 
     info = MediaInfo(path=path, duration=duration, has_video=False)
+    m = re.search(r"Duration: .*?start: (-?[\d.]+)", out)
+    if m:
+        info.start_time = float(m[1])
+    current: AudioStream | None = None   # stream whose metadata lines we're reading
     for line in out.splitlines():
-        if not info.has_video and re.search(r"Stream #\S+.*: Video:", line) and "attached pic" not in line:
-            info.has_video = True
-            r = re.search(r"\b(\d{2,5})x(\d{2,5})\b", line)
-            if r:
-                info.width, info.height = int(r[1]), int(r[2])
-            r = re.search(r"([\d.]+) fps", line) or re.search(r"([\d.]+)k? tbr", line)
-            info.fps = _to_rate(float(r[1])) if r else Fraction(30)
-        elif not info.has_audio and re.search(r"Stream #\S+.*: Audio:", line):
-            info.has_audio = True
-            r = re.search(r"(\d+) Hz", line)
-            if r:
-                info.sample_rate = int(r[1])
-            if "mono" in line:
-                info.channels = 1
-            elif "stereo" in line:
-                info.channels = 2
-            elif "5.1" in line:
-                info.channels = 6
-            elif "7.1" in line:
-                info.channels = 8
-            else:
-                r = re.search(r"(\d+) channels", line)
+        if re.search(r"Stream #\S+", line):
+            current = None
+            if re.search(r": Video:", line) and "attached pic" not in line and not info.has_video:
+                info.has_video = True
+                r = re.search(r"\b(\d{2,5})x(\d{2,5})\b", line)
                 if r:
-                    info.channels = int(r[1])
-        if info.timecode is None:
-            r = re.match(r"\s*timecode\s*:\s*(\d\d:\d\d:\d\d[:;]\d\d)", line)
-            if r:
-                info.timecode = r[1]
-    if not info.has_audio:
+                    info.width, info.height = int(r[1]), int(r[2])
+                r = re.search(r"([\d.]+) fps", line) or re.search(r"([\d.]+)k? tbr", line)
+                info.fps = _to_rate(float(r[1])) if r else Fraction(30)
+            elif re.search(r": Audio:", line):
+                r = re.search(r"(\d+) Hz", line)
+                current = AudioStream(index=len(info.audio), channels=_channels(line),
+                                      sample_rate=int(r[1]) if r else 48000)
+                info.audio.append(current)
+            continue
+        r = re.match(r"\s*title\s*:\s*(.+)", line)
+        if r and current is not None and not current.title:
+            current.title = r[1].strip()
+        r = re.match(r"\s*timecode\s*:\s*(\d\d:\d\d:\d\d[:;]\d\d)", line)
+        if r and info.timecode is None:
+            info.timecode = r[1]
+    if not info.audio:
         raise RuntimeError("This file has no audio track, so there is nothing to detect silence in.")
     return info
 
@@ -119,40 +151,18 @@ def probe(path: str) -> MediaInfo:
 
 @dataclass
 class Analysis:
-    samples: np.ndarray    # int16 mono @ ANALYSIS_SR (also used for preview playback)
-    db: np.ndarray         # loudness per HOP window, dBFS
+    dbs: list[np.ndarray]    # loudness per HOP window (dBFS), one array per audio track
     duration: float
 
-
-def decode_audio(path: str, progress=None, cancel=None, duration_hint: float = 0.0) -> np.ndarray:
-    cmd = [ffmpeg_exe(), "-v", "error", "-nostdin", "-i", path, "-map", "0:a:0", "-vn",
-           "-ac", "1", "-ar", str(ANALYSIS_SR), "-f", "s16le", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=_NO_WINDOW)
-    chunks, got = [], 0
-    expected = max(duration_hint, 1e-6) * ANALYSIS_SR * 2
-    try:
-        while True:
-            if cancel and cancel():
-                proc.kill()
-                raise Cancelled()
-            buf = proc.stdout.read(1 << 20)
-            if not buf:
-                break
-            chunks.append(buf)
-            got += len(buf)
-            if progress:
-                progress(min(got / expected, 1.0))
-    finally:
-        proc.stdout.close()
-    err = proc.stderr.read().decode("utf-8", "replace")
-    proc.wait()
-    data = b"".join(chunks)
-    if not data:
-        raise RuntimeError(f"Could not decode audio.\n{err.strip()}")
-    return np.frombuffer(data[: len(data) // 2 * 2], dtype=np.int16)
+    def combined(self, enabled: list[bool]) -> np.ndarray:
+        """Loudest enabled track per window: silence = every enabled track is quiet."""
+        picked = [d for d, on in zip(self.dbs, enabled) if on]
+        if not picked:
+            return np.full_like(self.dbs[0], DB_FLOOR)
+        return np.maximum.reduce(picked) if len(picked) > 1 else picked[0]
 
 
-def analyze(samples: np.ndarray) -> Analysis:
+def loudness(samples: np.ndarray) -> np.ndarray:
     hop_n = int(ANALYSIS_SR * HOP)
     n = int(np.ceil(len(samples) / hop_n))
     db = np.empty(n, dtype=np.float32)
@@ -164,13 +174,49 @@ def analyze(samples: np.ndarray) -> Analysis:
             seg = np.concatenate([seg, np.zeros(pad, np.float32)])
         rms = np.sqrt(np.mean(seg.reshape(-1, hop_n) ** 2, axis=1))
         db[i:i + len(rms)] = 20 * np.log10(np.maximum(rms, 1e-5))
-    return Analysis(samples=samples, db=db, duration=len(samples) / ANALYSIS_SR)
+    return db
+
+
+def analyze(info: MediaInfo, progress=None, cancel=None) -> Analysis:
+    """Decode every audio track in one pass (mono, 16 kHz) and measure loudness."""
+    tmp = tempfile.mkdtemp(prefix="freecut_")
+    raws = [os.path.join(tmp, f"a{s.index}.raw") for s in info.audio]
+    cmd = [ffmpeg_exe(), "-v", "error", "-nostdin", "-y", "-i", info.path]
+    for s, raw in zip(info.audio, raws):
+        cmd += ["-map", f"0:a:{s.index}", "-ac", "1", "-ar", str(ANALYSIS_SR), "-f", "s16le", raw]
+    cmd += ["-progress", "pipe:1", "-nostats"]
+    proc = popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        for line in proc.stdout:
+            if cancel and cancel():
+                proc.kill()
+                proc.wait()
+                raise Cancelled()
+            if line.startswith("out_time_us=") and progress and info.duration > 0:
+                try:
+                    progress(min(int(line.split("=")[1]) / 1e6 / info.duration, 1.0))
+                except ValueError:
+                    pass
+        err = proc.stderr.read()
+        proc.wait()
+        dbs = []
+        for raw in raws:
+            samples = np.fromfile(raw, dtype=np.int16) if os.path.exists(raw) else np.zeros(0, np.int16)
+            dbs.append(loudness(samples))
+        if not any(len(d) for d in dbs):
+            raise RuntimeError(f"Could not decode audio.\n{err.strip()}")
+    finally:
+        proc.stdout.close()
+        proc.stderr.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+    n = max(len(d) for d in dbs)
+    dbs = [np.concatenate([d, np.full(n - len(d), DB_FLOOR, np.float32)]) for d in dbs]
+    return Analysis(dbs=dbs, duration=n * HOP)
 
 
 def load(path: str, progress=None, cancel=None) -> tuple[MediaInfo, Analysis]:
     info = probe(path)
-    samples = decode_audio(path, progress, cancel, info.duration)
-    an = analyze(samples)
+    an = analyze(info, progress, cancel)
     if info.duration <= 0:
         info.duration = an.duration
     return info, an
@@ -183,6 +229,15 @@ def auto_threshold(db: np.ndarray) -> float:
     floor, loud = np.percentile(v, 10), np.percentile(v, 95)
     thr = floor + max(loud - floor, 6) * 0.3
     return float(np.clip(round(thr * 2) / 2, -70, -10))
+
+
+def grab_frame(path: str, t: float, w: int, h: int) -> bytes | None:
+    """One RGB24 frame at time t scaled to w x h, or None."""
+    cmd = [ffmpeg_exe(), "-v", "error", "-nostdin", "-ss", f"{max(t, 0):.3f}", "-i", path,
+           "-map", "0:v:0", "-frames:v", "1", "-vf", f"scale={w}:{h}", "-f", "rawvideo",
+           "-pix_fmt", "rgb24", "-"]
+    res = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+    return res.stdout if len(res.stdout) == w * h * 3 else None
 
 
 # --------------------------------------------------------------------------- detection
@@ -286,7 +341,8 @@ def _keep_seconds(info: MediaInfo, keeps):
     return merge(keeps), 0.0
 
 
-def _filter_script(info: MediaInfo, keeps, video: bool) -> str:
+def _filter_script(info: MediaInfo, keeps, video: bool, mix_audio: bool) -> tuple[str, list[str]]:
+    """Filtergraph plus the output labels to map."""
     ks, frame = _keep_seconds(info, keeps)
     # Video frames sit on the frame grid, so select with half-frame tolerance;
     # audio is selected in small chunks by exact start time.
@@ -294,21 +350,30 @@ def _filter_script(info: MediaInfo, keeps, video: bool) -> str:
     vsel = "+".join(f"between(t,{a - half:.6f},{b - half - 1e-6:.6f})" for a, b in ks)
     asel = "+".join(f"between(t,{a:.6f},{b - 1e-6:.6f})" for a, b in ks)
     # Output time = input time minus everything removed before it. Using the same
-    # mapping for audio and video keeps them locked together no matter how many cuts.
+    # mapping for every stream keeps them locked together no matter how many cuts.
     cuts, prev = [], 0.0
     for a, b in ks:
         if a > prev + 1e-9:
             cuts.append((prev, a - prev))
         prev = b
     shift = "+".join(f"clip(T-{s:.6f},0,{l:.6f})" for s, l in cuts) or "0"
-    parts = [
-        f"[0:a:0]asetpts=PTS-STARTPTS,asetnsamples=n=128:p=0,aselect='{asel}',"
-        f"asetpts='(T-({shift}))/TB',aresample=async=1:min_hard_comp=0.001:first_pts=0[a]"
-    ]
+    # Every stream is shifted by the same container start so their relative offsets survive.
+    zero = f"PTS-{info.start_time:.6f}/TB"
+    parts, labels = [], []
     if video:
-        parts.insert(0, f"[0:v:0]setpts=PTS-STARTPTS,select='{vsel}',setpts='(T-({shift}))/TB',"
-                        f"fps={info.timeline_fps}[v]")
-    return ";\n".join(parts)
+        parts.append(f"[0:v:0]setpts={zero},select='{vsel}',setpts='(T-({shift}))/TB',"
+                     f"fps={info.timeline_fps}[v]")
+        labels.append("[v]")
+    alabels = []
+    for s in info.audio:
+        parts.append(f"[0:a:{s.index}]asetpts={zero},asetnsamples=n=128:p=0,aselect='{asel}',"
+                     f"asetpts='(T-({shift}))/TB',aresample=async=1:min_hard_comp=0.001:first_pts=0"
+                     f"[a{s.index}]")
+        alabels.append(f"[a{s.index}]")
+    if mix_audio and len(alabels) > 1:
+        parts.append(f"{''.join(alabels)}amix=inputs={len(alabels)}:normalize=0[amix]")
+        alabels = ["[amix]"]
+    return ";\n".join(parts), labels + alabels
 
 
 def render(info: MediaInfo, keeps, out_path: str, quality: str = "High", speed: str = "medium",
@@ -318,25 +383,31 @@ def render(info: MediaInfo, keeps, out_path: str, quality: str = "High", speed: 
         raise RuntimeError("Nothing left to render: every part of the file is marked as cut.")
     total = sum(b - a for a, b in ks)
     ext = Path(out_path).suffix.lower()
-    video = info.has_video and ext not in AUDIO_CODECS
+    audio_only = ext in AUDIO_CODECS
+    video = info.has_video and not audio_only
+    graph, labels = _filter_script(info, keeps, video, mix_audio=audio_only)
     fd, script = tempfile.mkstemp(suffix=".txt", prefix="freecut_")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(_filter_script(info, keeps, video))
+        f.write(graph)
 
     cmd = [ffmpeg_exe(), "-y", "-hide_banner", "-nostdin", "-i", info.path, "-/filter_complex", script]
+    for label in labels:
+        cmd += ["-map", label]
     if video:
-        cmd += ["-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", speed,
-                "-crf", str(VIDEO_QUALITY.get(quality, 18)), "-pix_fmt", "yuv420p"]
+        cmd += ["-c:v", "libx264", "-preset", speed, "-crf", str(VIDEO_QUALITY.get(quality, 18)),
+                "-pix_fmt", "yuv420p"]
         cmd += ["-c:a", "libopus", "-b:a", "160k"] if ext == ".webm" else ["-c:a", "aac", "-b:a", "192k"]
         if ext in (".mp4", ".mov", ".m4v"):
             cmd += ["-movflags", "+faststart"]
+        for s in info.audio:  # keep track names
+            if s.title:
+                cmd += [f"-metadata:s:a:{s.index}", f"title={s.title}"]
     else:
-        cmd += ["-map", "[a]"] + AUDIO_CODECS.get(ext, ["-c:a", "aac", "-b:a", "192k"])
+        cmd += AUDIO_CODECS.get(ext, ["-c:a", "aac", "-b:a", "192k"])
     cmd += ["-progress", "pipe:1", "-nostats", out_path]
 
     err_file = tempfile.TemporaryFile()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_file, text=True,
-                            creationflags=_NO_WINDOW)
+    proc = popen(cmd, stdout=subprocess.PIPE, stderr=err_file, text=True)
     try:
         for line in proc.stdout:
             if cancel and cancel():
@@ -358,6 +429,7 @@ def render(info: MediaInfo, keeps, out_path: str, quality: str = "High", speed: 
             tail = err_file.read().decode("utf-8", "replace").strip().splitlines()[-15:]
             raise RuntimeError("ffmpeg failed:\n" + "\n".join(tail))
     finally:
+        proc.stdout.close()
         err_file.close()
         try:
             os.remove(script)
@@ -407,7 +479,11 @@ def export_premiere_xml(info: MediaInfo, keeps, out_path: str, name: str) -> Non
     src_len = round(info.duration * fps)
     tl_len = sum(b - a for a, b in frames)
     clip_name = Path(info.path).name
-    a_tracks = min(info.channels, 2)
+    # One timeline track per source audio track; a single stereo track becomes L + R.
+    if len(info.audio) == 1:
+        a_tracks = list(range(1, min(info.channels, 2) + 1))
+    else:
+        a_tracks = [s.index + 1 for s in info.audio]
 
     def rate(parent):
         r = _sub(parent, "rate")
@@ -443,7 +519,7 @@ def export_premiere_xml(info: MediaInfo, keeps, out_path: str, name: str) -> Non
     _sub(asc, "samplerate", info.sample_rate)
 
     v_track = _sub(video, "track") if info.has_video else None
-    a_track_els = [_sub(audio, "track") for _ in range(a_tracks)]
+    a_track_els = {idx: _sub(audio, "track") for idx in a_tracks}
     file_written = False
 
     def file_el(parent):
@@ -467,15 +543,15 @@ def export_premiere_xml(info: MediaInfo, keeps, out_path: str, name: str) -> Non
         s = _sub(am, "samplecharacteristics")
         _sub(s, "depth", 16)
         _sub(s, "samplerate", info.sample_rate)
-        _sub(am, "channelcount", info.channels)
+        _sub(am, "channelcount", len(a_tracks))
         return f
 
     tl = 0
     for i, (fa, fb) in enumerate(frames, 1):
         ids = ([("video", 1, f"clipitem-v{i}")] if info.has_video else []) + \
-              [("audio", ch, f"clipitem-a{ch}-{i}") for ch in range(1, a_tracks + 1)]
+              [("audio", idx, f"clipitem-a{idx}-{i}") for idx in a_tracks]
         for kind, idx, cid in ids:
-            track = v_track if kind == "video" else a_track_els[idx - 1]
+            track = v_track if kind == "video" else a_track_els[idx]
             ci = _sub(track, "clipitem", id=cid)
             _sub(ci, "name", clip_name)
             _sub(ci, "enabled", "TRUE")
@@ -519,7 +595,7 @@ def export_fcpxml(info: MediaInfo, keeps, out_path: str, name: str) -> None:
     res = _sub(root, "resources")
     _sub(res, "format", id="r1", frameDuration=t(1), width=w, height=h)
     _sub(res, "asset", id="r2", name=Path(info.path).stem, start=t(tc0), duration=t(src_len),
-         hasVideo=int(info.has_video), hasAudio=1, format="r1", audioSources=1,
+         hasVideo=int(info.has_video), hasAudio=1, format="r1", audioSources=len(info.audio),
          audioChannels=info.channels, audioRate=info.sample_rate, src=_file_url(info.path, True))
     event = _sub(_sub(root, "library"), "event", name="Freecut")
     project = _sub(event, "project", name=name)
