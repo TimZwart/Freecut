@@ -1,0 +1,16 @@
+build/
+dist/
+__pycache__/
+*.spec
+test/*.mp4
+test/*.mkv
+test/*.mp3
+test/*.xml
+test/*.fcpxml
+test/*.wav
+assets/freecut.ico
+# test inputs are needed by test/sync.py and test/gui_test.py; outputs stay ignored
+!test/in.mp4
+!test/multi.mkv
+!test/pod.mp3
+!test/audio_from_video.wav
