@@ -1,7 +1,7 @@
-"""Build a standalone Freecut.exe with PyInstaller.
+"""Build a standalone QuietCut.exe with PyInstaller.
 
-    python build.py             -> dist/Freecut/Freecut.exe  (folder, starts fast; zip it to share)
-    python build.py --onefile   -> dist/Freecut.exe          (single file, slower first start)
+    python build.py             -> dist/QuietCut/QuietCut.exe  (folder, starts fast; zip it to share)
+    python build.py --onefile   -> dist/QuietCut.exe          (single file, slower first start)
 """
 import os
 import subprocess
@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-ICON = ROOT / "assets" / "freecut.ico"
+ICON = ROOT / "assets" / "quietcut.ico"
 
 
 def make_icon():
@@ -36,15 +36,23 @@ def main():
     if not ICON.exists():
         make_icon()
     onefile = "--onefile" in sys.argv
+    # A running QuietCut.exe locks dist/QuietCut; PyInstaller would delete half of it and
+    # then fail, breaking the running copy. Refuse up front instead.
+    target = ROOT / "dist" / "QuietCut"
+    if not onefile and target.exists():
+        try:
+            target.rename(target)  # fails while any file inside is in use
+        except OSError:
+            sys.exit("dist/QuietCut is in use. Close QuietCut.exe and run the build again.")
     subprocess.check_call([
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
-        "--name", "Freecut", "--icon", str(ICON),
+        "--name", "QuietCut", "--icon", str(ICON),
         "--add-data", f"{ICON}{os.pathsep}assets",
         "--collect-all", "imageio_ffmpeg",     # bundles ffmpeg.exe
         "--onefile" if onefile else "--onedir",
-        "Freecut.pyw",
+        "QuietCut.pyw",
     ], cwd=ROOT)
-    out = ROOT / "dist" / ("Freecut.exe" if onefile else "Freecut/Freecut.exe")
+    out = ROOT / "dist" / ("QuietCut.exe" if onefile else "QuietCut/QuietCut.exe")
     print(f"\nBuilt {out}")
 
 

@@ -1,7 +1,7 @@
 import sys, time, tkinter as tk
 sys.path.insert(0, '.')
 from PIL import ImageGrab
-from freecut import app as A, player as P
+from quietcut import app as A, player as P
 import ctypes; ctypes.windll.shcore.SetProcessDpiAwareness(1)
 orig = P.Player._callback
 def muted(self, outdata, *a):

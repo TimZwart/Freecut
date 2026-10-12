@@ -1,3 +1,3 @@
-﻿from quietcut.app import main
+from quietcut.app import main
 
 main()

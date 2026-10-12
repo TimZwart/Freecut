@@ -8,7 +8,7 @@ test/*.mp3
 test/*.xml
 test/*.fcpxml
 test/*.wav
-assets/freecut.ico
+assets/quietcut.ico
 # test inputs are needed by test/sync.py and test/gui_test.py; outputs stay ignored
 !test/in.mp4
 !test/multi.mkv
